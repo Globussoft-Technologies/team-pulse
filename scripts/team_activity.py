@@ -59,8 +59,9 @@ def is_ignored(path):
         if d in "/" + p_l: return "vendor"
     if any(p_l.endswith(ext) for ext in BINARY_EXTS): return "binary"
     if any(p_l.endswith(m) for m in MINIFIED):       return "minified"
-    if any(h in p_l for h in GENERATED_HINTS):       return "generated"
     if p_l.endswith(".map"):                          return "sourcemap"
+    # Note: GENERATED_HINTS check intentionally disabled — protobuf / gql
+    # codegen + tests all count as authored work now. Someone wrote them.
     return ""
 
 def gh(*args):
@@ -261,7 +262,7 @@ def main():
         print(">")
         print("> **Code sitting on your laptop, not pushed to GitHub daily, is invisible here — and useless to the organization. Push every day.**")
         print(">")
-        print("> Updated nightly at 00:00 UTC. Real shipped code only — merge commits, vendor code, lockfiles, binaries, and auto-generated test scaffolding are excluded. (AI-assisted source code still counts — that's how everyone works now.) All branches scanned.")
+        print("> Updated nightly at 00:00 UTC. Real shipped code only — merge commits, vendor code, lockfiles, and binaries are excluded. Tests count. AI-assisted code counts. All branches scanned.")
         print()
         # Daily — primary view
         print(f"# 🏆 Top programmers — yesterday ({yest_str} UTC)")
