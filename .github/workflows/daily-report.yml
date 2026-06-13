@@ -1,0 +1,75 @@
+name: Daily team activity report
+
+# Triggers:
+#   - Scheduled run at 00:00 UTC every day
+#   - Manual trigger via the Actions UI
+# Hardening:
+#   - No pull_request / push triggers — secrets never exposed to PR contributors
+#   - permissions: read-only on this repo (cross-repo write happens via the PAT)
+#   - Minimal step set; only official actions
+#   - Token-bearing steps redirect stderr to /dev/null
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-report
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout team-pulse
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify gh CLI auth
+        env:
+          GH_TOKEN: ${{ secrets.ORG_REPORTER_TOKEN }}
+        run: gh auth status
+
+      - name: Generate markdown report
+        env:
+          GH_TOKEN: ${{ secrets.ORG_REPORTER_TOKEN }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          python scripts/team_activity.py --days 1 --md > report.md 2>/dev/null
+          echo "::group::report.md preview"
+          head -50 report.md
+          echo "::endgroup::"
+
+      - name: Clone .github-private
+        env:
+          GH_TOKEN: ${{ secrets.ORG_REPORTER_TOKEN }}
+        run: |
+          git config --global user.name  "team-pulse-bot"
+          git config --global user.email "team-pulse@users.noreply.github.com"
+          gh repo clone Globussoft-Technologies/.github-private private 2>/dev/null
+
+      - name: Inject report between markers
+        run: |
+          python scripts/inject_report.py private/profile/README.md report.md
+
+      - name: Commit and push if changed
+        working-directory: private
+        env:
+          GH_TOKEN: ${{ secrets.ORG_REPORTER_TOKEN }}
+        run: |
+          if git diff --quiet profile/README.md; then
+            echo "No changes to push."
+            exit 0
+          fi
+          git add profile/README.md
+          git commit -m "report: daily team activity $(date -u +'%Y-%m-%d')"
+          git push 2>/dev/null
