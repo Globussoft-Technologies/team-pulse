@@ -259,6 +259,8 @@ def main():
         print(">")
         print("> **This data is used to analyze appraisal requests for programmers and developers.**")
         print(">")
+        print("> **Code sitting on your laptop, not pushed to GitHub daily, is invisible here — and useless to the organization. Push every day.**")
+        print(">")
         print("> Updated nightly at 00:00 UTC. Real authored code only — merge commits, vendor code, lockfiles, binaries, and generated files are excluded. All branches scanned.")
         print()
         # Daily — primary view
