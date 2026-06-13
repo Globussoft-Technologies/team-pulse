@@ -261,7 +261,7 @@ def main():
         print(">")
         print("> **Code sitting on your laptop, not pushed to GitHub daily, is invisible here — and useless to the organization. Push every day.**")
         print(">")
-        print("> Updated nightly at 00:00 UTC. Real authored code only — merge commits, vendor code, lockfiles, binaries, and generated files are excluded. All branches scanned.")
+        print("> Updated nightly at 00:00 UTC. Real shipped code only — merge commits, vendor code, lockfiles, binaries, and auto-generated test scaffolding are excluded. (AI-assisted source code still counts — that's how everyone works now.) All branches scanned.")
         print()
         # Daily — primary view
         print(f"# 🏆 Top programmers — yesterday ({yest_str} UTC)")
