@@ -14,21 +14,6 @@ Every day at **00:00 UTC**, a scheduled GitHub Actions workflow:
 
 The rendered page is visible to **org members only**.
 
-## Why this repo is public
-
-GitHub Free has a 2000-min/month Actions cap on **private** repos. **Public-repo Actions are unmetered** — so the cron runs free, indefinitely, regardless of the org's private-Actions usage.
-
-## Security model
-
-- The workflow uses a single secret (`ORG_REPORTER_TOKEN`) — a **fine-grained PAT** scoped to:
-  - **Read**: all repos in `Globussoft-Technologies` (metadata + contents)
-  - **Write**: only `Globussoft-Technologies/.github-private` (contents)
-- The PAT lives only as an encrypted Actions Secret. **Never** in workflow YAML or logs.
-- Workflow has no `pull_request` / `push` triggers, so the secret cannot be reached by PR contributors.
-- Forks of this repo are disabled at the repo level (Settings → General → Allow forking = off).
-- Default repo permission is `read`; cross-repo writes go through the PAT only.
-- Workflow stderr is suppressed to avoid leaking the private-repo names being scanned.
-
 ## Files
 
 | Path | Purpose |
