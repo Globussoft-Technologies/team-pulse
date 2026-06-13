@@ -55,7 +55,7 @@ jobs:
         run: |
           git config --global user.name  "team-pulse-bot"
           git config --global user.email "team-pulse@users.noreply.github.com"
-          gh repo clone Globussoft-Technologies/.github-private private 2>/dev/null
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/Globussoft-Technologies/.github-private.git" private 2>/dev/null
 
       - name: Inject report between markers
         run: |
@@ -72,4 +72,4 @@ jobs:
           fi
           git add profile/README.md
           git commit -m "report: daily team activity $(date -u +'%Y-%m-%d')"
-          git push 2>/dev/null
+          git push
