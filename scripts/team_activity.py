@@ -257,6 +257,8 @@ def main():
         print(">")
         print("> **If your name is NOT on the leaderboard below, be very careful about your appraisal and future layoffs.**")
         print(">")
+        print("> **This data is used to analyze appraisal requests for programmers and developers.**")
+        print(">")
         print("> Updated nightly at 00:00 UTC. Real authored code only — merge commits, vendor code, lockfiles, binaries, and generated files are excluded. All branches scanned.")
         print()
         # Daily — primary view
