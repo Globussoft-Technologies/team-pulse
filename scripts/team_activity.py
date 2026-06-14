@@ -48,8 +48,9 @@ BOTS = {
 # Map alternative identities → canonical login.
 # Add a line whenever someone commits under more than one GitHub account / git author.
 IDENTITY_ALIASES = {
-    "indianbill007": "sumitglobussoft",
-    "Sumit Ghosh":   "sumitglobussoft",
+    "indianbill007":              "sumitglobussoft",
+    "Sumit Ghosh":                "sumitglobussoft",
+    "suhailkhan@globussoft.in":   "suhailGlobussoft",
 }
 
 def is_ignored(path):
@@ -98,6 +99,58 @@ def aggregate_by_author(commit_records, since_dt):
         s["del"]     += c["del"]
         s["repos"].add(c["repo"])
     return stats
+
+def compute_streaks(commit_records, today_utc):
+    """Per-author current shipping streak (consecutive UTC calendar days ending
+    yesterday) + longest streak found in the scan window + total active days."""
+    by_author = defaultdict(set)
+    for c in commit_records:
+        cd = datetime.fromisoformat(c["date"].replace("Z","+00:00")).date()
+        by_author[c["login"]].add(cd)
+    out = {}
+    for author, dates in by_author.items():
+        if not dates: continue
+        # Current streak: walk backward from yesterday
+        cur = 0
+        check = today_utc - timedelta(days=1)
+        while check in dates:
+            cur += 1
+            check -= timedelta(days=1)
+        # Longest streak observed in the window
+        longest = 0; run = 1
+        sorted_dates = sorted(dates)
+        for i in range(1, len(sorted_dates)):
+            if (sorted_dates[i] - sorted_dates[i-1]).days == 1:
+                run += 1
+            else:
+                longest = max(longest, run)
+                run = 1
+        longest = max(longest, run)
+        out[author] = {"current": cur, "longest": longest, "active_days": len(dates)}
+    return out
+
+def render_md_streaks(streaks, top_n=15):
+    """Render the streaks section."""
+    if not streaks:
+        return
+    # Active streaks: current >= 1, ranked by current desc then longest desc
+    active = sorted(((a,s) for a,s in streaks.items() if s["current"] >= 1),
+                    key=lambda x: (-x[1]["current"], -x[1]["longest"]))
+    if active:
+        print("| 🔥 Current streak | Engineer | Days active (last 365) |")
+        print("|---:|---|---:|")
+        for a, s in active[:top_n]:
+            print(f"| {s['current']} | [@{a}](https://github.com/{a}) | {s['active_days']} |")
+        print()
+    else:
+        print("_Nobody on an active streak right now. Push something today and start one._")
+        print()
+    # Hall of fame: longest streaks in the year, regardless of current state
+    hall = sorted(streaks.items(), key=lambda x: -x[1]["longest"])[:5]
+    if hall:
+        line = " · ".join(f"**[@{a}](https://github.com/{a})** — {s['longest']} days" for a,s in hall)
+        print(f"🏆 **Longest streaks (last 365 days)**: {line}")
+        print()
 
 def render_md_table(stats, top_n):
     """Emit one markdown leaderboard table from author stats."""
@@ -296,6 +349,13 @@ def main():
         print()
         render_md_table(daily_stats, args.top)
         print()
+        # Shipping streaks — surfaces habits, not single-day spikes
+        streaks = compute_streaks(all_commit_records, today_utc)
+        print("## 🔥 Active shipping streaks")
+        print()
+        print("Consecutive UTC days you've pushed code, ending yesterday. Skip a day → streak resets. Push every day.")
+        print()
+        render_md_streaks(streaks)
         # Weekly — expandable
         print(f"<details>")
         print(f"<summary><b>📅 Weekly view — last 7 days ({week_start} → {yest_str} UTC)</b></summary>")
