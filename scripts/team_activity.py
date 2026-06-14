@@ -9,11 +9,12 @@ Usage:
   python scripts/team_activity.py --since 2026-06-01 --until 2026-06-13
   python scripts/team_activity.py --days 1 --drill 3
 """
-import argparse, subprocess, json, sys
+import argparse, subprocess, json, sys, os
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 
-ORG = "Globussoft-Technologies"
+# Orgs scanned by default. Override with --orgs A,B,C
+DEFAULT_ORGS = ["Globussoft-Technologies", "EmpCloud"]
 
 LOCK_FILES = {
     "package-lock.json","yarn.lock","pnpm-lock.yaml","composer.lock",
@@ -64,9 +65,24 @@ def is_ignored(path):
     # codegen + tests all count as authored work now. Someone wrote them.
     return ""
 
+_CURRENT_TOKEN = None
+def set_token(t):
+    """Set the gh-CLI token used by subsequent gh() calls."""
+    global _CURRENT_TOKEN
+    _CURRENT_TOKEN = t
+
+def token_for_org(org):
+    """Resolve which token to use for an org.
+    Per-org env var wins; falls back to GH_TOKEN."""
+    key = "GH_TOKEN_" + org.upper().replace("-","_").replace(".","_")
+    return os.environ.get(key) or os.environ.get("GH_TOKEN") or ""
+
 def gh(*args):
+    env = os.environ.copy()
+    if _CURRENT_TOKEN:
+        env["GH_TOKEN"] = _CURRENT_TOKEN
     r = subprocess.run(["gh","api",*args], capture_output=True, text=True,
-                       encoding="utf-8", errors="replace")
+                       encoding="utf-8", errors="replace", env=env)
     return r.stdout if r.returncode == 0 else None
 
 def aggregate_by_author(commit_records, since_dt):
@@ -120,6 +136,8 @@ def parse_args():
                    help="Scan only the default branch (faster, but misses unmerged feature-branch work)")
     p.add_argument("--md", action="store_true",
                    help="Emit Markdown (for org profile README); leaderboard only")
+    p.add_argument("--orgs", default=",".join(DEFAULT_ORGS),
+                   help="Comma-separated orgs to scan")
     return p.parse_args()
 
 def main():
@@ -134,14 +152,9 @@ def main():
         until = today.isoformat() + "T00:00:00Z"
         scan_days = 365 if args.md else args.days
         since = (today - timedelta(days=scan_days)).isoformat() + "T00:00:00Z"
+    orgs = [o.strip() for o in args.orgs.split(",") if o.strip()]
     print(f"Window: {since}  →  {until}", file=sys.stderr)
-    print(f"Org: {ORG}", file=sys.stderr)
-
-    repos = subprocess.run(
-        ["gh","api",f"orgs/{ORG}/repos","--paginate","-q",".[].name"],
-        capture_output=True, text=True, encoding="utf-8", errors="replace"
-    ).stdout.strip().split("\n")
-    print(f"Scanning {len(repos)} repos…\n", file=sys.stderr)
+    print(f"Orgs: {', '.join(orgs)}", file=sys.stderr)
 
     author_stats = defaultdict(lambda: {"commits":0,"add":0,"del":0,
                                         "repos":set(),"ignored_add":0,"ignored_del":0,
@@ -149,73 +162,87 @@ def main():
     ignored_breakdown = defaultdict(int)
     all_commit_records = []  # flat list for windowed re-aggregation in --md mode
 
-    for i, repo in enumerate(repos, 1):
-        print(f"[{i}/{len(repos)}] {repo}", file=sys.stderr)
-        # Gather candidate branches
-        if args.main_only:
-            branches = [None]  # gh defaults to default branch when sha omitted
-        else:
-            br_raw = gh(f"repos/{ORG}/{repo}/branches?per_page=100")
-            try:
-                branches = [b["name"] for b in json.loads(br_raw)] if br_raw else [None]
-            except Exception:
-                branches = [None]
-            if not branches: branches = [None]
-        # Dedupe commits by sha across branches
-        seen = {}
-        for br in branches:
-            q = f"since={since}&until={until}&per_page=100"
-            if br: q += f"&sha={br}"
-            out = gh(f"repos/{ORG}/{repo}/commits?{q}")
-            if not out: continue
-            try:
-                cs = json.loads(out)
-            except Exception:
-                continue
-            if not isinstance(cs, list): continue
-            for c in cs:
-                if c["sha"] not in seen:
-                    seen[c["sha"]] = c
-        for sha, c in seen.items():
-            # Skip merge commits unless explicitly included
-            if not args.include_merges and len(c.get("parents", [])) > 1:
-                continue
-            login = (c.get("author") or {}).get("login") or c["commit"]["author"]["name"]
-            login = IDENTITY_ALIASES.get(login, login)
-            msg = c["commit"]["message"].splitlines()[0][:80]
-            detail_raw = gh(f"repos/{ORG}/{repo}/commits/{sha}")
-            if not detail_raw: continue
-            try:
-                detail = json.loads(detail_raw)
-            except Exception:
-                continue
-            files = detail.get("files",[])
-            real_add = real_del = ign_add = ign_del = 0
-            top_files = []
-            for f in files:
-                fa = f.get("additions",0); fd = f.get("deletions",0)
-                fn = f.get("filename","")
-                reason = "" if args.include_vendor else is_ignored(fn)
-                if reason:
-                    ign_add += fa; ign_del += fd
-                    ignored_breakdown[reason] += fa + fd
-                else:
-                    real_add += fa; real_del += fd
-                    top_files.append((fa+fd, fa, fd, fn))
-            s = author_stats[login]
-            s["commits"] += 1
-            s["add"] += real_add; s["del"] += real_del
-            s["ignored_add"] += ign_add; s["ignored_del"] += ign_del
-            s["repos"].add(repo)
-            s["commit_records"].append({
-                "repo":repo,"sha":sha[:7],"msg":msg,
-                "add":real_add,"del":real_del,"top_files":top_files,
-            })
-            all_commit_records.append({
-                "repo": repo, "sha": sha, "login": login,
-                "date": c["commit"]["author"]["date"],
-                "add": real_add, "del": real_del,
-            })
+    for org in orgs:
+        set_token(token_for_org(org))
+        repos_raw = subprocess.run(
+            ["gh","api",f"orgs/{org}/repos","--paginate","-q",".[].name"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env={**os.environ, **({"GH_TOKEN":_CURRENT_TOKEN} if _CURRENT_TOKEN else {})}
+        ).stdout.strip()
+        if not repos_raw:
+            print(f"[{org}] no repos (auth issue?)", file=sys.stderr)
+            continue
+        repos = repos_raw.split("\n")
+        print(f"[{org}] scanning {len(repos)} repos…", file=sys.stderr)
+
+        for i, repo in enumerate(repos, 1):
+            repo_qualified = f"{org}/{repo}"
+            print(f"  [{i}/{len(repos)}] {repo_qualified}", file=sys.stderr)
+            # Gather candidate branches
+            if args.main_only:
+                branches = [None]  # gh defaults to default branch when sha omitted
+            else:
+                br_raw = gh(f"repos/{org}/{repo}/branches?per_page=100")
+                try:
+                    branches = [b["name"] for b in json.loads(br_raw)] if br_raw else [None]
+                except Exception:
+                    branches = [None]
+                if not branches: branches = [None]
+            # Dedupe commits by sha across branches
+            seen = {}
+            for br in branches:
+                q = f"since={since}&until={until}&per_page=100"
+                if br: q += f"&sha={br}"
+                out = gh(f"repos/{org}/{repo}/commits?{q}")
+                if not out: continue
+                try:
+                    cs = json.loads(out)
+                except Exception:
+                    continue
+                if not isinstance(cs, list): continue
+                for c in cs:
+                    if c["sha"] not in seen:
+                        seen[c["sha"]] = c
+            for sha, c in seen.items():
+                # Skip merge commits unless explicitly included
+                if not args.include_merges and len(c.get("parents", [])) > 1:
+                    continue
+                login = (c.get("author") or {}).get("login") or c["commit"]["author"]["name"]
+                login = IDENTITY_ALIASES.get(login, login)
+                msg = c["commit"]["message"].splitlines()[0][:80]
+                detail_raw = gh(f"repos/{org}/{repo}/commits/{sha}")
+                if not detail_raw: continue
+                try:
+                    detail = json.loads(detail_raw)
+                except Exception:
+                    continue
+                files = detail.get("files",[])
+                real_add = real_del = ign_add = ign_del = 0
+                top_files = []
+                for f in files:
+                    fa = f.get("additions",0); fd = f.get("deletions",0)
+                    fn = f.get("filename","")
+                    reason = "" if args.include_vendor else is_ignored(fn)
+                    if reason:
+                        ign_add += fa; ign_del += fd
+                        ignored_breakdown[reason] += fa + fd
+                    else:
+                        real_add += fa; real_del += fd
+                        top_files.append((fa+fd, fa, fd, fn))
+                s = author_stats[login]
+                s["commits"] += 1
+                s["add"] += real_add; s["del"] += real_del
+                s["ignored_add"] += ign_add; s["ignored_del"] += ign_del
+                s["repos"].add(repo_qualified)
+                s["commit_records"].append({
+                    "repo":repo_qualified,"sha":sha[:7],"msg":msg,
+                    "add":real_add,"del":real_del,"top_files":top_files,
+                })
+                all_commit_records.append({
+                    "repo": repo_qualified, "sha": sha, "login": login,
+                    "date": c["commit"]["author"]["date"],
+                    "add": real_add, "del": real_del,
+                })
 
     if not args.include_bots:
         for b in list(author_stats):

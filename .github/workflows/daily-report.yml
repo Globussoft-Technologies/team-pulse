@@ -41,7 +41,14 @@ jobs:
 
       - name: Generate markdown report
         env:
+          # Primary token (used when no per-org override exists)
           GH_TOKEN: ${{ secrets.ORG_REPORTER_TOKEN }}
+          # Per-org tokens. If a secret is unset it evaluates to "" and we
+          # fall back to GH_TOKEN. Use this if you have separate fine-grained
+          # PATs per org. Skip these and just set ORG_REPORTER_TOKEN to a
+          # classic PAT if one token covers both orgs.
+          GH_TOKEN_GLOBUSSOFT_TECHNOLOGIES: ${{ secrets.ORG_REPORTER_TOKEN }}
+          GH_TOKEN_EMPCLOUD: ${{ secrets.EMPCLOUD_REPORTER_TOKEN }}
           PYTHONIOENCODING: utf-8
         run: |
           python scripts/team_activity.py --days 1 --md > report.md 2>/dev/null
