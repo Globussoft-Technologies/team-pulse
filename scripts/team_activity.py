@@ -100,6 +100,98 @@ def aggregate_by_author(commit_records, since_dt):
         s["repos"].add(c["repo"])
     return stats
 
+def find_pr_signals(orgs, today_utc):
+    """For each org, find PRs MERGED on yesterday UTC.
+    Returns (first_prs, review_counts).
+      first_prs:     list of {author, org, repo, title, url, number}
+                     for PRs where author has only one merged PR in the org ever.
+      review_counts: dict {reviewer_login: count_of_yesterday_PRs_they_reviewed}
+                     (excludes PR author, bots, identity-collapsed)
+    """
+    yesterday = (today_utc - timedelta(days=1)).isoformat()
+    first_prs = []
+    review_counts = defaultdict(int)
+    for org in orgs:
+        set_token(token_for_org(org))
+        # Find PRs merged yesterday
+        merged_query = f"is:pr is:merged org:{org} merged:{yesterday}"
+        result = gh("-X", "GET", "search/issues", "-f", f"q={merged_query}")
+        if not result: continue
+        try:
+            data = json.loads(result)
+        except Exception:
+            continue
+        items = data.get("items", []) or []
+        for pr in items:
+            user = pr.get("user") or {}
+            author = user.get("login") or ""
+            if not author: continue
+            author = IDENTITY_ALIASES.get(author, author)
+            # Get review info for this PR
+            pr_api_url = (pr.get("pull_request") or {}).get("url","")
+            if pr_api_url:
+                # Strip the API host prefix
+                reviews_path = pr_api_url.replace("https://api.github.com/","") + "/reviews"
+                reviews_raw = gh(reviews_path)
+                if reviews_raw:
+                    try:
+                        review_data = json.loads(reviews_raw)
+                        # Count each distinct reviewer once per PR
+                        seen_reviewers = set()
+                        for r in review_data:
+                            ru = r.get("user") or {}
+                            reviewer = ru.get("login") or ""
+                            if not reviewer: continue
+                            if reviewer.endswith("[bot]"): continue
+                            if reviewer in BOTS: continue
+                            reviewer = IDENTITY_ALIASES.get(reviewer, reviewer)
+                            if reviewer == author: continue   # self-review doesn't count
+                            if reviewer in seen_reviewers: continue
+                            seen_reviewers.add(reviewer)
+                            review_counts[reviewer] += 1
+                    except Exception:
+                        pass
+            # Check if this is the author's first ever merged PR in this org
+            first_check_query = f"is:pr is:merged org:{org} author:{author}"
+            first_result = gh("-X", "GET", "search/issues", "-f", f"q={first_check_query}")
+            if first_result:
+                try:
+                    first_data = json.loads(first_result)
+                    if first_data.get("total_count", 0) == 1:
+                        repo_name = (pr.get("repository_url") or "").split("/")[-1]
+                        first_prs.append({
+                            "author": author, "org": org, "repo": repo_name,
+                            "title": pr.get("title",""),
+                            "url":   pr.get("html_url",""),
+                            "number": pr.get("number"),
+                        })
+                except Exception:
+                    pass
+    return first_prs, dict(review_counts)
+
+def render_md_first_prs(first_prs):
+    if not first_prs: return
+    print("## 🎉 First PRs landed yesterday")
+    print()
+    print("Welcome to the codebase — these engineers just shipped their first merged PR. Buy them a coffee, leave a 👍, send a note.")
+    print()
+    for pr in first_prs:
+        print(f"- [@{pr['author']}](https://github.com/{pr['author']}) — **{pr['org']}/{pr['repo']}** · [{pr['title']}]({pr['url']})")
+    print()
+
+def render_md_reviewers(review_counts, top_n=10):
+    if not review_counts: return
+    print("## 👀 Top reviewers — yesterday")
+    print()
+    print("Reviewing is half the job. These engineers reviewed PRs that merged yesterday:")
+    print()
+    print("| # | Reviewer | PRs reviewed |")
+    print("|---:|---|---:|")
+    ranked = sorted(review_counts.items(), key=lambda x: -x[1])
+    for i, (reviewer, count) in enumerate(ranked[:top_n], 1):
+        print(f"| {i} | [@{reviewer}](https://github.com/{reviewer}) | {count} |")
+    print()
+
 def compute_streaks(commit_records, today_utc):
     """Per-author current shipping streak (consecutive UTC calendar days ending
     yesterday) + longest streak found in the scan window + total active days."""
@@ -356,6 +448,14 @@ def main():
         print("Consecutive UTC days you've pushed code, ending yesterday. Skip a day → streak resets. Push every day.")
         print()
         render_md_streaks(streaks)
+        # PR signals: first PRs + top reviewers (yesterday only — search API)
+        try:
+            first_prs, review_counts = find_pr_signals(orgs, today_utc)
+            render_md_first_prs(first_prs)
+            render_md_reviewers(review_counts)
+        except Exception as e:
+            print(f"<!-- PR signals skipped: {e} -->")
+            print()
         # Weekly — expandable
         print(f"<details>")
         print(f"<summary><b>📅 Weekly view — last 7 days ({week_start} → {yest_str} UTC)</b></summary>")
