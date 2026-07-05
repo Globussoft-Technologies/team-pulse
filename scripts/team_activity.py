@@ -14,7 +14,7 @@ from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 
 # Orgs scanned by default. Override with --orgs A,B,C
-DEFAULT_ORGS = ["Globussoft-Technologies", "EmpCloud"]
+DEFAULT_ORGS = ["Globussoft-Technologies", "EmpCloud", "Build-With-Sumit"]
 
 LOCK_FILES = {
     "package-lock.json","yarn.lock","pnpm-lock.yaml","composer.lock",

@@ -1,12 +1,12 @@
 # team-pulse
 
-Org-wide daily team-activity reporter for [Globussoft Technologies](https://github.com/Globussoft-Technologies).
+Org-wide daily team-activity reporter across [Globussoft-Technologies](https://github.com/Globussoft-Technologies), [EmpCloud](https://github.com/EmpCloud), and [Build-With-Sumit](https://github.com/Build-With-Sumit).
 
 ## What it does
 
 Every day at **00:00 UTC**, a scheduled GitHub Actions workflow:
 
-1. Scans every repo in the `Globussoft-Technologies` org
+1. Scans every repo in each configured org (see `DEFAULT_ORGS` in `scripts/team_activity.py`)
 2. Pulls yesterday's commits across **all branches** (catches feature-branch work, not just merges to `main`)
 3. Filters out: merge commits, vendor code, lockfiles, binaries, minified/generated paths, known bot accounts
 4. Aggregates by author into a leaderboard
