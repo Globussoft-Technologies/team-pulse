@@ -8,13 +8,25 @@ Usage:
   python scripts/team_activity.py --days 7         # last 7 days
   python scripts/team_activity.py --since 2026-06-01 --until 2026-06-13
   python scripts/team_activity.py --days 1 --drill 3
+  python scripts/team_activity.py --repos globusphone --days 2   # single repo
+  python scripts/team_activity.py --md --cache-file commit-cache/details.json
+
+Reliability: the scan is rate-limit-aware (waits + retries on 403/429),
+paginates every list endpoint, and caches immutable per-SHA diff stats so
+repeat runs stay well under GitHub's 5000 req/hr limit. Diffs are hydrated
+newest-first, so daily/weekly/monthly windows are always complete even if the
+deep-history tail is deferred to a later run.
 """
-import argparse, subprocess, json, sys, os
+import argparse, subprocess, json, sys, os, time
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 
 # Orgs scanned by default. Override with --orgs A,B,C
 DEFAULT_ORGS = ["Globussoft-Technologies", "EmpCloud", "Build-With-Sumit"]
+
+# Bump whenever is_ignored() (the vendor/lockfile/binary filter) changes — it
+# invalidates every cached per-commit diff stat so they get recomputed.
+CACHE_VERSION = 1
 
 LOCK_FILES = {
     "package-lock.json","yarn.lock","pnpm-lock.yaml","composer.lock",
@@ -78,13 +90,110 @@ def token_for_org(org):
     key = "GH_TOKEN_" + org.upper().replace("-","_").replace(".","_")
     return os.environ.get(key) or os.environ.get("GH_TOKEN") or ""
 
-def gh(*args):
+def _run_gh(args, token):
     env = os.environ.copy()
-    if _CURRENT_TOKEN:
-        env["GH_TOKEN"] = _CURRENT_TOKEN
-    r = subprocess.run(["gh","api",*args], capture_output=True, text=True,
-                       encoding="utf-8", errors="replace", env=env)
-    return r.stdout if r.returncode == 0 else None
+    if token:
+        env["GH_TOKEN"] = token
+    return subprocess.run(["gh","api",*args], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", env=env)
+
+def _rate_reset_seconds(token):
+    """Seconds to wait for the core rate-limit to reset (0 if budget remains).
+    The rate_limit endpoint itself does not count against the core budget."""
+    r = _run_gh(["rate_limit"], token)
+    try:
+        core = json.loads(r.stdout)["resources"]["core"]
+    except Exception:
+        return 60
+    if core.get("remaining", 0) > 0:
+        return 0
+    return max(5, int(core.get("reset", 0) - time.time()) + 5)
+
+def gh(*args, retries=6):
+    """`gh api` wrapper that SURVIVES rate limits instead of silently failing.
+
+    The old version returned None on any non-zero exit, so a 403 (primary rate
+    limit) made the caller drop the commit — which is exactly how active repos
+    fell off the leaderboard. Here we detect primary + secondary rate limits,
+    wait for the reset (or back off), and retry. None is returned only after all
+    retries fail on a genuine, non-rate error."""
+    for attempt in range(retries):
+        r = _run_gh(list(args), _CURRENT_TOKEN)
+        if r.returncode == 0:
+            return r.stdout
+        err = (r.stderr or "").lower()
+        is_rate = ("rate limit" in err or "secondary rate" in err
+                   or "was submitted too quickly" in err or "429" in err
+                   or "you have exceeded" in err)
+        if is_rate:
+            wait = _rate_reset_seconds(_CURRENT_TOKEN)
+            if "secondary" in err or "too quickly" in err:
+                wait = max(wait, 30 * (attempt + 1))   # secondary-limit backoff
+            wait = min(max(wait, 5), 3600)
+            print(f"  rate limited — sleeping {wait}s then retrying "
+                  f"(attempt {attempt+1}/{retries})", file=sys.stderr)
+            time.sleep(wait)
+            continue
+        if attempt < retries - 1:
+            time.sleep(2 * (attempt + 1))              # transient-error backoff
+            continue
+        print(f"  gh api error [{' '.join(str(a) for a in args)}]: "
+              f"{(r.stderr or '').strip()[:160]}", file=sys.stderr)
+        return None
+    return None
+
+def gh_paginate(path, per_page=100, extra=""):
+    """Yield ALL items from a paginated list endpoint. The old code fetched a
+    single per_page=100 page with no pagination, silently truncating any repo or
+    branch with >100 commits in the window. `path` must not already contain a
+    query string; pass query params via `extra`."""
+    page = 1
+    while True:
+        q = f"{path}?per_page={per_page}&page={page}"
+        if extra:
+            q += f"&{extra}"
+        out = gh(q)
+        if not out:
+            return
+        try:
+            items = json.loads(out)
+        except Exception:
+            return
+        if not isinstance(items, list) or not items:
+            return
+        for it in items:
+            yield it
+        if len(items) < per_page:
+            return
+        page += 1
+
+def gh_list_names(path):
+    return [x.get("name") for x in gh_paginate(path) if x.get("name")]
+
+def load_cache(path):
+    """Load the per-SHA diff-stat cache. Commit diffs are immutable, so once a
+    SHA is fetched it never needs re-fetching — this is what keeps daily runs
+    under the rate limit after the first warm-up."""
+    if path and os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                d = json.load(f)
+            if d.get("v") == CACHE_VERSION:
+                return d.get("c", {})
+        except Exception:
+            pass
+    return {}
+
+def save_cache(path, cache):
+    if not path:
+        return
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"v": CACHE_VERSION, "c": cache}, f)
+    os.replace(tmp, path)
 
 def aggregate_by_author(commit_records, since_dt):
     """Filter flat commit records by author-date, aggregate per login."""
@@ -283,6 +392,19 @@ def parse_args():
                    help="Emit Markdown (for org profile README); leaderboard only")
     p.add_argument("--orgs", default=",".join(DEFAULT_ORGS),
                    help="Comma-separated orgs to scan")
+    p.add_argument("--repos", default="",
+                   help="Comma-separated repo names to restrict the scan to "
+                        "(useful for testing a single repo)")
+    p.add_argument("--cache-file", default=os.environ.get("COMMIT_CACHE", ""),
+                   help="JSON cache of per-SHA diff stats. Immutable by SHA, so "
+                        "repeat runs only fetch NEW commits — keeps us under the "
+                        "5000 req/hr limit. Env: COMMIT_CACHE")
+    p.add_argument("--max-details", type=int,
+                   default=int(os.environ.get("MAX_DETAILS", "3500") or "3500"),
+                   help="Max FRESH per-commit diff fetches per run (rate-limit "
+                        "budget). Newest commits fetched first; the deep-history "
+                        "tail fills in across subsequent runs as the cache warms. "
+                        "<=0 means unlimited (relies on rate-limit back-off).")
     return p.parse_args()
 
 def main():
@@ -307,66 +429,94 @@ def main():
     ignored_breakdown = defaultdict(int)
     all_commit_records = []  # flat list for windowed re-aggregation in --md mode
 
+    only_repos = {r.strip() for r in args.repos.split(",") if r.strip()} or None
+
+    # ── Phase 1: gather commit STUBS (cheap paginated LIST calls only) ─────────
+    # A stub is everything known before the per-commit diff: sha, repo, author
+    # login, author date, subject. Merge commits are dropped here. Deduped by
+    # sha globally (SHAs are globally unique).
+    stubs = {}
     for org in orgs:
         set_token(token_for_org(org))
-        repos_raw = subprocess.run(
-            ["gh","api",f"orgs/{org}/repos","--paginate","-q",".[].name"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            env={**os.environ, **({"GH_TOKEN":_CURRENT_TOKEN} if _CURRENT_TOKEN else {})}
-        ).stdout.strip()
-        if not repos_raw:
+        repos = gh_list_names(f"orgs/{org}/repos")
+        if not repos:
             print(f"[{org}] no repos (auth issue?)", file=sys.stderr)
             continue
-        repos = repos_raw.split("\n")
+        if only_repos:
+            repos = [r for r in repos if r in only_repos]
         print(f"[{org}] scanning {len(repos)} repos…", file=sys.stderr)
 
         for i, repo in enumerate(repos, 1):
             repo_qualified = f"{org}/{repo}"
             print(f"  [{i}/{len(repos)}] {repo_qualified}", file=sys.stderr)
-            # Gather candidate branches
             if args.main_only:
                 branches = [None]  # gh defaults to default branch when sha omitted
             else:
-                br_raw = gh(f"repos/{org}/{repo}/branches?per_page=100")
-                try:
-                    branches = [b["name"] for b in json.loads(br_raw)] if br_raw else [None]
-                except Exception:
-                    branches = [None]
-                if not branches: branches = [None]
-            # Dedupe commits by sha across branches
-            seen = {}
+                branches = [b.get("name") for b in
+                            gh_paginate(f"repos/{org}/{repo}/branches")] or [None]
             for br in branches:
-                q = f"since={since}&until={until}&per_page=100"
-                if br: q += f"&sha={br}"
-                out = gh(f"repos/{org}/{repo}/commits?{q}")
-                if not out: continue
-                try:
-                    cs = json.loads(out)
-                except Exception:
-                    continue
-                if not isinstance(cs, list): continue
-                for c in cs:
-                    if c["sha"] not in seen:
-                        seen[c["sha"]] = c
-            for sha, c in seen.items():
-                # Skip merge commits unless explicitly included
-                if not args.include_merges and len(c.get("parents", [])) > 1:
-                    continue
-                login = (c.get("author") or {}).get("login") or c["commit"]["author"]["name"]
-                login = IDENTITY_ALIASES.get(login, login)
-                msg = c["commit"]["message"].splitlines()[0][:80]
-                detail_raw = gh(f"repos/{org}/{repo}/commits/{sha}")
-                if not detail_raw: continue
+                extra = f"since={since}&until={until}"
+                if br:
+                    extra += f"&sha={br}"
+                for c in gh_paginate(f"repos/{org}/{repo}/commits", extra=extra):
+                    sha = c.get("sha")
+                    if not sha or sha in stubs:
+                        continue
+                    # Skip merge commits unless explicitly included
+                    if not args.include_merges and len(c.get("parents", [])) > 1:
+                        continue
+                    login = (c.get("author") or {}).get("login") or c["commit"]["author"]["name"]
+                    login = IDENTITY_ALIASES.get(login, login)
+                    msg = (c["commit"]["message"].splitlines() or [""])[0][:80]
+                    stubs[sha] = {
+                        "sha": sha, "org": org, "repo": repo_qualified,
+                        "login": login, "date": c["commit"]["author"]["date"],
+                        "msg": msg,
+                    }
+
+    # ── Phase 2: hydrate diffs — NEWEST FIRST, cache-backed, budget-bounded ────
+    # Newest-first is the key correctness guarantee: even if we exhaust the API
+    # budget on the deep (yearly) tail, the daily/weekly/monthly windows are
+    # always fully hydrated. Deferred deep-history commits fill in on later runs
+    # as the cache warms. --include-vendor changes the numbers, so it bypasses
+    # the cache to avoid poisoning normal runs.
+    use_cache = bool(args.cache_file) and not args.include_vendor
+    cache = load_cache(args.cache_file) if use_cache else {}
+    order = sorted(stubs.values(), key=lambda st: st["date"], reverse=True)
+    cache_hits = fresh = deferred = failed = 0
+
+    for st in order:
+        sha, org, repo_qualified = st["sha"], st["org"], st["repo"]
+        cached = cache.get(sha) if use_cache else None
+        top_files = []
+        if isinstance(cached, list) and len(cached) == 4:
+            real_add, real_del, ign_add, ign_del = cached
+            cache_hits += 1
+        else:
+            if args.max_details > 0 and fresh >= args.max_details:
+                # Out of budget this run — skip (don't record) so numbers stay
+                # clean; the cache warms and this commit is counted next run.
+                deferred += 1
+                continue
+            set_token(token_for_org(org))
+            repo_name = repo_qualified.split("/", 1)[1]
+            detail_raw = gh(f"repos/{org}/{repo_name}/commits/{sha}")
+            fresh += 1
+            real_add = real_del = ign_add = ign_del = 0
+            if not detail_raw:
+                # Hard failure even after retries: record the commit with 0 lines
+                # so the author still shows up (commit count) — never vanish.
+                failed += 1
+                print(f"  WARN diff fetch failed, counting 0 lines: "
+                      f"{repo_qualified}@{sha[:7]}", file=sys.stderr)
+            else:
                 try:
                     detail = json.loads(detail_raw)
                 except Exception:
-                    continue
-                files = detail.get("files",[])
-                real_add = real_del = ign_add = ign_del = 0
-                top_files = []
-                for f in files:
-                    fa = f.get("additions",0); fd = f.get("deletions",0)
-                    fn = f.get("filename","")
+                    detail = {}
+                for f in detail.get("files", []):
+                    fa = f.get("additions", 0); fd = f.get("deletions", 0)
+                    fn = f.get("filename", "")
                     reason = "" if args.include_vendor else is_ignored(fn)
                     if reason:
                         ign_add += fa; ign_del += fd
@@ -374,20 +524,29 @@ def main():
                     else:
                         real_add += fa; real_del += fd
                         top_files.append((fa+fd, fa, fd, fn))
-                s = author_stats[login]
-                s["commits"] += 1
-                s["add"] += real_add; s["del"] += real_del
-                s["ignored_add"] += ign_add; s["ignored_del"] += ign_del
-                s["repos"].add(repo_qualified)
-                s["commit_records"].append({
-                    "repo":repo_qualified,"sha":sha[:7],"msg":msg,
-                    "add":real_add,"del":real_del,"top_files":top_files,
-                })
-                all_commit_records.append({
-                    "repo": repo_qualified, "sha": sha, "login": login,
-                    "date": c["commit"]["author"]["date"],
-                    "add": real_add, "del": real_del,
-                })
+                if use_cache:
+                    cache[sha] = [real_add, real_del, ign_add, ign_del]
+
+        login = st["login"]
+        s = author_stats[login]
+        s["commits"] += 1
+        s["add"] += real_add; s["del"] += real_del
+        s["ignored_add"] += ign_add; s["ignored_del"] += ign_del
+        s["repos"].add(repo_qualified)
+        s["commit_records"].append({
+            "repo": repo_qualified, "sha": sha[:7], "msg": st["msg"],
+            "add": real_add, "del": real_del, "top_files": top_files,
+        })
+        all_commit_records.append({
+            "repo": repo_qualified, "sha": sha, "login": login,
+            "date": st["date"], "add": real_add, "del": real_del,
+        })
+
+    if use_cache:
+        save_cache(args.cache_file, cache)
+    print(f"[hydrate] {len(order)} commits · {cache_hits} cached · {fresh} fetched "
+          f"· {failed} failed · {deferred} deferred (cold-cache tail, fills next run)",
+          file=sys.stderr)
 
     if not args.include_bots:
         for b in list(author_stats):

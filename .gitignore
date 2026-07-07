@@ -3,3 +3,6 @@ __pycache__/
 .venv/
 private/
 report.md
+
+# Local per-SHA diff cache (persisted in CI via actions/cache)
+commit-cache/
