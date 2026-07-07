@@ -131,6 +131,11 @@ def gh(*args, retries=8):
             time.sleep(_THROTTLE)
         r = _run_gh(list(args), _CURRENT_TOKEN)
         if r.returncode == 0:
+            # Decay the throttle on sustained success so it spikes right after a
+            # secondary-limit hit, then relaxes — keeps cold runs from paying a
+            # flat per-call tax for their whole duration.
+            if _THROTTLE:
+                _THROTTLE = max(0.0, _THROTTLE - 0.05)
             return r.stdout
         err = (r.stderr or "").lower()
         is_rate = ("rate limit" in err or "secondary rate" in err
@@ -143,7 +148,7 @@ def gh(*args, retries=8):
                 kind = "primary"
             else:
                 wait = min(60 * (2 ** attempt), 900)    # secondary/abuse: exp. backoff
-                _THROTTLE = min(_THROTTLE + 0.25, 2.0)   # slow the baseline rate
+                _THROTTLE = min(_THROTTLE + 0.25, 1.0)   # slow the baseline rate (capped)
                 kind = "secondary"
             wait = min(max(wait, 5), 3600)
             print(f"  {kind} rate limit — sleeping {wait}s then retrying "
