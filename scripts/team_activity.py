@@ -109,15 +109,26 @@ def _rate_reset_seconds(token):
         return 0
     return max(5, int(core.get("reset", 0) - time.time()) + 5)
 
-def gh(*args, retries=6):
+_THROTTLE = 0.0   # adaptive inter-request delay; ramps up after a secondary-limit hit
+
+def gh(*args, retries=8):
     """`gh api` wrapper that SURVIVES rate limits instead of silently failing.
 
-    The old version returned None on any non-zero exit, so a 403 (primary rate
-    limit) made the caller drop the commit — which is exactly how active repos
-    fell off the leaderboard. Here we detect primary + secondary rate limits,
-    wait for the reset (or back off), and retry. None is returned only after all
-    retries fail on a genuine, non-rate error."""
+    The old version returned None on any non-zero exit, so a 403 (rate limit)
+    made the caller drop the commit — which is exactly how active repos fell off
+    the leaderboard. Here we distinguish the two GitHub limits:
+
+      * PRIMARY  (core budget exhausted): the reset timestamp tells us exactly
+        how long to wait, so we sleep until then.
+      * SECONDARY / abuse (core budget still remaining, yet 403/429): there is
+        no reset timestamp, so we back off exponentially (60s, 120s, …) and also
+        ramp a small global inter-request throttle to stop re-tripping it.
+
+    None is returned only after all retries fail on a genuine, non-rate error."""
+    global _THROTTLE
     for attempt in range(retries):
+        if _THROTTLE:
+            time.sleep(_THROTTLE)
         r = _run_gh(list(args), _CURRENT_TOKEN)
         if r.returncode == 0:
             return r.stdout
@@ -126,16 +137,22 @@ def gh(*args, retries=6):
                    or "was submitted too quickly" in err or "429" in err
                    or "you have exceeded" in err)
         if is_rate:
-            wait = _rate_reset_seconds(_CURRENT_TOKEN)
-            if "secondary" in err or "too quickly" in err:
-                wait = max(wait, 30 * (attempt + 1))   # secondary-limit backoff
+            reset_wait = _rate_reset_seconds(_CURRENT_TOKEN)
+            if reset_wait > 0:
+                wait = reset_wait                       # primary: wait for core reset
+                kind = "primary"
+            else:
+                wait = min(60 * (2 ** attempt), 900)    # secondary/abuse: exp. backoff
+                _THROTTLE = min(_THROTTLE + 0.25, 2.0)   # slow the baseline rate
+                kind = "secondary"
             wait = min(max(wait, 5), 3600)
-            print(f"  rate limited — sleeping {wait}s then retrying "
-                  f"(attempt {attempt+1}/{retries})", file=sys.stderr)
+            print(f"  {kind} rate limit — sleeping {wait}s then retrying "
+                  f"(attempt {attempt+1}/{retries}, throttle={_THROTTLE:.2f}s)",
+                  file=sys.stderr)
             time.sleep(wait)
             continue
         if attempt < retries - 1:
-            time.sleep(2 * (attempt + 1))              # transient-error backoff
+            time.sleep(2 * (attempt + 1))               # transient-error backoff
             continue
         print(f"  gh api error [{' '.join(str(a) for a in args)}]: "
               f"{(r.stderr or '').strip()[:160]}", file=sys.stderr)
