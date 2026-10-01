@@ -55,6 +55,10 @@ GENERATED_HINTS = (
 BOTS = {
     "mirror-bot","dependabot","dependabot[bot]","github-actions",
     "github-actions[bot]","renovate","renovate[bot]",
+    # This report's own daily README commit: its email
+    # team-pulse@users.noreply.github.com resolves to the Team-Pulse account,
+    # which then ranked on the board and held the longest streak.
+    "Team-Pulse",
 }
 
 # Map alternative identities → canonical login.
