@@ -160,7 +160,12 @@ def gh(*args, retries=8):
                   file=sys.stderr)
             time.sleep(wait)
             continue
-        if attempt < retries - 1:
+        # 404 / 409 / 422 give the same answer every time ("No common ancestor",
+        # "Git Repository is empty"); retrying them only burns calls and sleep,
+        # and on a repo like dominator (200+ unrelated branches) the burst trips
+        # the secondary rate limit.
+        final = any(f"(HTTP {c})" in (r.stderr or "") for c in (404, 409, 422))
+        if attempt < retries - 1 and not final:
             time.sleep(2 * (attempt + 1))               # transient-error backoff
             continue
         print(f"  gh api error [{' '.join(str(a) for a in args)}]: "
@@ -193,6 +198,37 @@ def gh_paginate(path, per_page=100, extra=""):
             return
         page += 1
 
+_HEADS_Q = """query($owner:String!,$name:String!,$cursor:String){
+  repository(owner:$owner,name:$name){
+    refs(refPrefix:"refs/heads/",first:100,after:$cursor){
+      pageInfo{hasNextPage endCursor}
+      nodes{name target{oid ... on Commit{committedDate}}}
+    }
+  }
+}"""
+
+def gh_branch_heads(org, repo):
+    """[(branch, head_sha, head_committed_date)] for every branch, 100 per
+    GraphQL call; REST /branches gives no date. None if GraphQL fails, so the
+    caller can fall back to REST."""
+    heads, cursor = [], None
+    while True:
+        args = ["graphql", "-f", f"query={_HEADS_Q}",
+                "-f", f"owner={org}", "-f", f"name={repo}"]
+        if cursor:
+            args += ["-f", f"cursor={cursor}"]
+        out = gh(*args)
+        try:
+            refs = json.loads(out)["data"]["repository"]["refs"]
+        except Exception:
+            return None
+        for n in refs.get("nodes") or []:
+            t = n.get("target") or {}
+            heads.append((n.get("name"), t.get("oid"), t.get("committedDate")))
+        if not refs["pageInfo"]["hasNextPage"]:
+            return heads
+        cursor = refs["pageInfo"]["endCursor"]
+
 def gh_compare_commits(org, repo, base_sha, head_sha, per_page=100):
     """Commits reachable from head_sha but not from base_sha: what a branch adds
     on top of the default branch. One call for a typical branch, where listing
@@ -205,7 +241,7 @@ def gh_compare_commits(org, repo, base_sha, head_sha, per_page=100):
     commits, ahead_by, page = [], None, 1
     while True:
         out = gh(f"repos/{org}/{repo}/compare/{base_sha}...{head_sha}"
-                 f"?per_page={per_page}&page={page}", retries=3)
+                 f"?per_page={per_page}&page={page}")
         if not out:
             return None
         try:
@@ -516,10 +552,18 @@ def main():
             if args.main_only:
                 branches = [(None, None)]  # gh defaults to default branch when sha omitted
             else:
-                blist = list(gh_paginate(f"repos/{org}/{repo}/branches"))
-                blist.sort(key=lambda b: b.get("name") != default)   # default first
-                branches = [(b.get("name"), (b.get("commit") or {}).get("sha"))
-                            for b in blist] or [(None, None)]
+                blist = gh_branch_heads(org, repo)
+                if blist is None:
+                    blist = [(b.get("name"), (b.get("commit") or {}).get("sha"), None)
+                             for b in gh_paginate(f"repos/{org}/{repo}/branches")]
+                # A head last committed before the window adds nothing to it
+                # (0 commits lost on crm/adsgpt/videoraiq/dominator vs git log),
+                # and comparing unrelated histories, which most of dominator's
+                # 211 old branches are, trips GitHub's CPU-time rate limit.
+                blist = [b for b in blist
+                         if b[0] == default or not b[2] or b[2] >= since]
+                blist.sort(key=lambda b: b[0] != default)   # default first
+                branches = [(name, sha) for name, sha, _ in blist] or [(None, None)]
             print(f"  [{i}/{len(repos)}] {repo_qualified} ({len(branches)} branches)",
                   file=sys.stderr)
             base_sha = None
@@ -537,6 +581,8 @@ def main():
                     commits = gh_paginate(f"repos/{org}/{repo}/commits", extra=extra)
                 if br == default:
                     base_sha = head
+                if head:
+                    seen.add(head)   # another branch at this head adds nothing
                 for c in commits:
                     sha = c.get("sha")
                     if not sha:
