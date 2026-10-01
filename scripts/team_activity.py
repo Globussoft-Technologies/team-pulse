@@ -189,8 +189,37 @@ def gh_paginate(path, per_page=100, extra=""):
             return
         page += 1
 
-def gh_list_names(path):
-    return [x.get("name") for x in gh_paginate(path) if x.get("name")]
+def gh_compare_commits(org, repo, base_sha, head_sha, per_page=100):
+    """Commits reachable from head_sha but not from base_sha: what a branch adds
+    on top of the default branch. One call for a typical branch, where listing
+    the branch re-reads the whole shared history (globussoft-crm has 300+
+    branches; doing that for each one ran the scan past its 3h timeout).
+
+    Returns None when the compare is unusable (no common ancestor, an error, or
+    fewer commits than GitHub says the branch is ahead by) so the caller falls
+    back to a full listing rather than undercount."""
+    commits, ahead_by, page = [], None, 1
+    while True:
+        out = gh(f"repos/{org}/{repo}/compare/{base_sha}...{head_sha}"
+                 f"?per_page={per_page}&page={page}", retries=3)
+        if not out:
+            return None
+        try:
+            data = json.loads(out)
+        except Exception:
+            return None
+        items = data.get("commits")
+        if not isinstance(items, list):
+            return None
+        if ahead_by is None:
+            ahead_by = data.get("ahead_by")
+        commits.extend(items)
+        if len(items) < per_page:
+            break
+        page += 1
+    if ahead_by is not None and len(commits) != ahead_by:
+        return None
+    return commits
 
 def load_cache(path):
     """Load the per-SHA diff-stat cache. Commit diffs are immutable, so once a
@@ -457,33 +486,64 @@ def main():
     # A stub is everything known before the per-commit diff: sha, repo, author
     # login, author date, subject. Merge commits are dropped here. Deduped by
     # sha globally (SHAs are globally unique).
+    #
+    # The default branch is listed in full; every other branch contributes only
+    # the commits it adds on top of it (gh_compare_commits). A branch whose head
+    # was already reached by an earlier walk is skipped outright: its history is
+    # a subset of that walk. Compare returns commits regardless of date, so the
+    # window is applied here, on the committer date the commits API's
+    # since/until filter on.
     stubs = {}
+    seen = set()   # every sha already walked, merges included
     for org in orgs:
         set_token(token_for_org(org))
-        repos = gh_list_names(f"orgs/{org}/repos")
+        repos = [r for r in gh_paginate(f"orgs/{org}/repos") if r.get("name")]
         if not repos:
             print(f"[{org}] no repos (auth issue?)", file=sys.stderr)
             continue
         if only_repos:
-            repos = [r for r in repos if r in only_repos]
+            repos = [r for r in repos if r["name"] in only_repos]
         print(f"[{org}] scanning {len(repos)} repos…", file=sys.stderr)
 
-        for i, repo in enumerate(repos, 1):
+        for i, repo_obj in enumerate(repos, 1):
+            repo = repo_obj["name"]
+            default = repo_obj.get("default_branch")
             repo_qualified = f"{org}/{repo}"
-            print(f"  [{i}/{len(repos)}] {repo_qualified}", file=sys.stderr)
             if args.main_only:
-                branches = [None]  # gh defaults to default branch when sha omitted
+                branches = [(None, None)]  # gh defaults to default branch when sha omitted
             else:
-                branches = [b.get("name") for b in
-                            gh_paginate(f"repos/{org}/{repo}/branches")] or [None]
-            for br in branches:
-                extra = f"since={since}&until={until}"
-                if br:
-                    extra += f"&sha={br}"
-                for c in gh_paginate(f"repos/{org}/{repo}/commits", extra=extra):
+                blist = list(gh_paginate(f"repos/{org}/{repo}/branches"))
+                blist.sort(key=lambda b: b.get("name") != default)   # default first
+                branches = [(b.get("name"), (b.get("commit") or {}).get("sha"))
+                            for b in blist] or [(None, None)]
+            print(f"  [{i}/{len(repos)}] {repo_qualified} ({len(branches)} branches)",
+                  file=sys.stderr)
+            base_sha = None
+            for br, head in branches:
+                if head and head in seen:
+                    continue
+                commits = None
+                if base_sha and head:
+                    commits = gh_compare_commits(org, repo, base_sha, head)
+                in_window = commits is None   # a listing is already windowed
+                if commits is None:
+                    extra = f"since={since}&until={until}"
+                    if br:
+                        extra += f"&sha={br}"
+                    commits = gh_paginate(f"repos/{org}/{repo}/commits", extra=extra)
+                if br == default:
+                    base_sha = head
+                for c in commits:
                     sha = c.get("sha")
-                    if not sha or sha in stubs:
+                    if not sha:
                         continue
+                    seen.add(sha)
+                    if sha in stubs:
+                        continue
+                    if not in_window:
+                        cdate = ((c.get("commit") or {}).get("committer") or {}).get("date") or ""
+                        if not (since <= cdate <= until):
+                            continue
                     # Skip merge commits unless explicitly included
                     if not args.include_merges and len(c.get("parents", [])) > 1:
                         continue

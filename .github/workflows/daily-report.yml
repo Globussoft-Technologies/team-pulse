@@ -17,6 +17,7 @@ on:
 
 permissions:
   contents: read
+  actions: write   # only for the keep-alive step below
 
 concurrency:
   group: daily-report
@@ -29,6 +30,16 @@ jobs:
     # add wait time). Steady-state warm runs finish in a few minutes.
     timeout-minutes: 180
     steps:
+      # GitHub turns a schedule off after 60 days with no commits to the repo.
+      # This job commits to .github-private, never here, so the schedule went
+      # dark on ~2026-09-06 (state: disabled_inactivity). Re-enabling the
+      # workflow from inside it restarts that clock. First, so a failed scan
+      # still keeps the schedule alive.
+      - name: Keep the schedule enabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/daily-report.yml/enable"
+
       - name: Checkout team-pulse
         uses: actions/checkout@v4
 
